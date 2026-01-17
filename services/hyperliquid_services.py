@@ -58,7 +58,54 @@ class HyperliquidServices:
         
         network = "testnet" if testnet else "mainnet"
         self.logger.info(f"HyperliquidServices initialized for account {self.account_address} on {network}")
-    
+
+    def _get_asset_info(self, coin: str) -> Dict[str, Any]:
+        """
+        Get asset metadata including szDecimals for proper rounding.
+        Returns dict with 'szDecimals' and 'maxPriceDecimals' (6 - szDecimals for perps).
+        """
+        try:
+            meta = self.info.meta()
+            for asset_info in meta.get('universe', []):
+                if asset_info.get('name') == coin:
+                    sz_decimals = asset_info.get('szDecimals', 0)
+                    # For perpetuals: max price decimals = 6 - szDecimals
+                    # Prices must have <= 5 significant figures
+                    max_price_decimals = 6 - sz_decimals
+                    return {
+                        'szDecimals': sz_decimals,
+                        'maxPriceDecimals': max_price_decimals
+                    }
+        except Exception as e:
+            self.logger.warning(f"Failed to get asset info for {coin}: {e}")
+        # Defaults: 0 decimals for size, 1 for price (conservative)
+        return {'szDecimals': 0, 'maxPriceDecimals': 1}
+
+    def _round_size(self, size: float, sz_decimals: int) -> float:
+        """Round size down to the asset's szDecimals (truncate, don't round up)."""
+        multiplier = 10 ** sz_decimals
+        return int(size * multiplier) / multiplier
+
+    def _round_price(self, price: float, max_decimals: int) -> float:
+        """
+        Round price to valid tick size per Hyperliquid rules:
+        - Max 5 significant figures
+        - Max 'max_decimals' decimal places
+        - Integer prices are always valid regardless of sig figs
+        """
+        if price == 0:
+            return 0
+
+        # First, round to 5 significant figures
+        # Use Python's float formatting with 5 sig figs
+        rounded_5sf = float(f"{price:.5g}")
+
+        # Then, round to max_decimals decimal places
+        multiplier = 10 ** max_decimals
+        final = round(rounded_5sf * multiplier) / multiplier
+
+        return final
+
     def _bulk_orders_with_grouping(self, order_requests, grouping="na", builder=None):
         """
         Custom bulk orders implementation that allows setting proper grouping for OCO orders
@@ -204,16 +251,31 @@ class HyperliquidServices:
         """
         try:
             side = "BUY" if is_buy else "SELL"
-            self.logger.info(f"Placing order: {coin} {side} {sz} @ {limit_px}")
-            
+
+            # Get asset info for proper rounding
+            asset_info = self._get_asset_info(coin)
+            sz_decimals = asset_info['szDecimals']
+            max_price_decimals = asset_info['maxPriceDecimals']
+
+            # Round size and price to valid tick/lot sizes
+            original_sz = float(sz)
+            original_px = float(limit_px)
+            sz = self._round_size(original_sz, sz_decimals)
+            limit_px = self._round_price(original_px, max_price_decimals)
+
+            self.logger.info(f"Placing order: {coin} {side} {sz} @ {limit_px} (original: {original_sz} @ {original_px}, szDecimals={sz_decimals}, maxPriceDecimals={max_price_decimals})")
+
             # If TP or SL is specified, use bracket order logic
             if tp_px is not None or sl_px is not None:
                 if tp_px is None or sl_px is None:
                     raise ValueError("Both take_profit_px and stop_loss_px must be specified for bracket orders")
+                # Round TP/SL prices as well
+                tp_px = self._round_price(float(tp_px), max_price_decimals)
+                sl_px = self._round_price(float(sl_px), max_price_decimals)
                 return await self.place_bracket_order(
                     coin, is_buy, sz, limit_px, tp_px, sl_px, reduce_only, cloid
                 )
-            
+
             # Default order type
             if order_type is None:
                 order_type = {"limit": {"tif": "Gtc"}}
@@ -275,17 +337,29 @@ class HyperliquidServices:
         """
         try:
             side = "BUY" if is_buy else "SELL"
-            self.logger.info(f"Placing bracket order with normalTpSl grouping: {coin} {side} {sz} @ {limit_px}, TP: {take_profit_px}, SL: {stop_loss_px}")
-            
+
+            # Get asset info for proper rounding
+            asset_info = self._get_asset_info(coin)
+            sz_decimals = asset_info['szDecimals']
+            max_price_decimals = asset_info['maxPriceDecimals']
+
+            # Round size and prices to valid tick/lot sizes
+            sz = self._round_size(float(sz), sz_decimals)
+            limit_px = self._round_price(float(limit_px), max_price_decimals)
+            take_profit_px = self._round_price(float(take_profit_px), max_price_decimals)
+            stop_loss_px = self._round_price(float(stop_loss_px), max_price_decimals)
+
+            self.logger.info(f"Placing bracket order with normalTpSl grouping: {coin} {side} {sz} @ {limit_px}, TP: {take_profit_px}, SL: {stop_loss_px} (szDecimals={sz_decimals}, maxPriceDecimals={max_price_decimals})")
+
             # Prepare order requests for bulk_orders
             order_requests = []
-            
+
             # Entry order
             entry_order = {
                 "coin": coin,
                 "is_buy": is_buy,
-                "sz": float(sz),
-                "limit_px": float(limit_px),
+                "sz": sz,
+                "limit_px": limit_px,
                 "order_type": {"limit": {"tif": "Gtc"}},
                 "reduce_only": reduce_only
             }
@@ -671,7 +745,18 @@ class HyperliquidServices:
         try:
             if tp_px is None and sl_px is None:
                 raise ValueError("At least one of tp_px or sl_px must be specified")
-                
+
+            # Get asset info for proper rounding
+            asset_info = self._get_asset_info(coin)
+            sz_decimals = asset_info['szDecimals']
+            max_price_decimals = asset_info['maxPriceDecimals']
+
+            # Round trigger prices to valid tick size
+            if tp_px is not None:
+                tp_px = self._round_price(float(tp_px), max_price_decimals)
+            if sl_px is not None:
+                sl_px = self._round_price(float(sl_px), max_price_decimals)
+
             # Get current position if size not provided
             if position_size is None:
                 user_state = self.info.user_state(self.account_address)
@@ -688,8 +773,8 @@ class HyperliquidServices:
                 if not position_found:
                     raise ValueError(f"No position found for {coin}")
             
-            position_size = float(position_size)
-            
+            position_size = self._round_size(float(position_size), sz_decimals)
+
             # Determine if position is long or short
             user_state = self.info.user_state(self.account_address)
             is_long = True  # Default
@@ -789,10 +874,18 @@ class HyperliquidServices:
             Dict containing success status and order details
         """
         try:
-            self.logger.info(f"Opening {'long' if is_buy else 'short'} position for {coin} with size {sz}")
-            
+            # Get asset info for proper rounding
+            asset_info = self._get_asset_info(coin)
+            sz_decimals = asset_info['szDecimals']
+
+            # Round size to valid lot size
+            original_sz = float(sz)
+            sz = self._round_size(original_sz, sz_decimals)
+
+            self.logger.info(f"Opening {'long' if is_buy else 'short'} position for {coin} with size {sz} (original: {original_sz}, szDecimals={sz_decimals})")
+
             # Use market_open directly
-            order_result = self.exchange.market_open(coin, is_buy, float(sz), cloid)
+            order_result = self.exchange.market_open(coin, is_buy, sz, cloid)
             
             self.logger.info(f"Position opened successfully for {coin}: {order_result}")
             

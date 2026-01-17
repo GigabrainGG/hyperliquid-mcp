@@ -524,45 +524,60 @@ async def calculate_token_amount_from_dollars(
 ) -> Dict[str, Any]:
     """
     Calculate how many tokens can be bought with a given dollar amount
-    
+
     Args:
         coin: Trading pair (e.g., "BTC", "ETH", "SOL")
         dollar_amount: Dollar amount to spend (e.g., 20.0 for $20)
-        
+
     Returns:
-        Dictionary with token amount and current price
-        
-    Example: calculate_token_amount_from_dollars("SOL", 20.0) 
-             → {"token_amount": 0.133, "current_price": 150.0, "dollar_amount": 20.0}
+        Dictionary with token amount, current price, and sz_decimals for proper rounding
+
+    Example: calculate_token_amount_from_dollars("SOL", 20.0)
+             → {"token_amount": 0.133, "current_price": 150.0, "dollar_amount": 20.0, "sz_decimals": 1}
     """
     initialize_service()
-    
+
     # Get current market price
     market_data = await hyperliquid_service.get_market_data(coin)
-    
+
     if not market_data.get("success"):
         return {
             "success": False,
             "error": f"Failed to get market data for {coin}: {market_data.get('error', 'Unknown error')}"
         }
-    
+
     current_price = market_data["market_data"]["mid_price"]
     if current_price == "N/A":
         return {
             "success": False,
             "error": f"Could not get current price for {coin}"
         }
-    
+
     current_price = float(current_price)
+
+    # Get szDecimals for this asset from metadata
+    sz_decimals = 0  # Default to 0 (whole numbers) - safest for most altcoins
+    try:
+        meta = hyperliquid_service.info.meta()
+        for asset_info in meta.get('universe', []):
+            if asset_info.get('name') == coin:
+                sz_decimals = asset_info.get('szDecimals', 0)
+                break
+    except Exception:
+        pass  # Use default if metadata fetch fails
+
     token_amount = dollar_amount / current_price
-    
+    # Truncate to the asset's szDecimals (don't round up to avoid oversizing)
+    token_amount_truncated = int(token_amount * (10 ** sz_decimals)) / (10 ** sz_decimals)
+
     return {
         "success": True,
         "coin": coin,
         "dollar_amount": dollar_amount,
         "current_price": current_price,
-        "token_amount": round(token_amount, 8),  # Round to 8 decimal places
-        "calculation": f"${dollar_amount} ÷ ${current_price} = {token_amount:.8f} {coin}"
+        "token_amount": token_amount_truncated,
+        "sz_decimals": sz_decimals,
+        "calculation": f"${dollar_amount} ÷ ${current_price} = {token_amount_truncated} {coin} (truncated to {sz_decimals} decimals)"
     }
 
 
